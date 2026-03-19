@@ -4,13 +4,10 @@ import pandas as pd
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import torch.multiprocessing as mp
 
 from engine import (
     Move,
-    Game_state,
     apply_move,
     add_new_tile,
     get_new_board,
@@ -21,7 +18,7 @@ GAMMA = 0.999
 
 
 class VNN(nn.Module):
-    def __init__(self, device, intermediate_size=100, conv_out_size=10):
+    def __init__(self, device, intermediate_size=256, conv_out_size=128):
         super(VNN, self).__init__()
         self.device = device
 
@@ -47,15 +44,15 @@ class VNN(nn.Module):
 
         self.linear_1 = nn.Linear(
             2 * conv_out_size * 4 * 3 + intermediate_size**2,
-            256,
+            512,
         )
 
-        self.linear_2 = nn.Linear(256, 256)
-        self.linear_3 = nn.Linear(256, 256)
-        self.linear_4 = nn.Linear(256, 128)
-        self.linear_5 = nn.Linear(128, 64)
-        self.linear_6 = nn.Linear(64, 16)
-        self.linear_7 = nn.Linear(16, 1)
+        self.linear_2 = nn.Linear(512, 512)
+        self.linear_3 = nn.Linear(512, 512)
+        self.linear_4 = nn.Linear(512, 256)
+        self.linear_5 = nn.Linear(256, 128)
+        self.linear_6 = nn.Linear(128, 64)
+        self.linear_7 = nn.Linear(64, 1)
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -114,10 +111,15 @@ class VNN(nn.Module):
                                 }
                             )
 
-            # Single batched forward pass over all next boards
+            # Chunked forward pass to avoid OOM on large batches
+            CHUNK_SIZE = 1024
             if len(all_entries) > 0:
-                next_boards = [e["board"] for e in all_entries]
-                values = self.forward_from_int_boards(next_boards).flatten().tolist()
+                all_values = []
+                for chunk_start in range(0, len(all_entries), CHUNK_SIZE):
+                    chunk = all_entries[chunk_start : chunk_start + CHUNK_SIZE]
+                    chunk_values = self.forward_from_int_boards([e["board"] for e in chunk]).flatten().tolist()
+                    all_values.extend(chunk_values)
+                values = all_values
 
                 df = pd.DataFrame(
                     {
@@ -132,20 +134,23 @@ class VNN(nn.Module):
                 for (board_idx, move_name), group in df.groupby(["board_idx", "move"]):
                     next_value_fn[board_idx][move_name] = group["value_x_prob"].sum()
 
-            results = []
+            best_moves_and_implied_values = []
             for board_idx in range(n):
-                best_move = max(
-                    list(Move),
-                    key=lambda m, i=board_idx: reward_fn[i][m.value]
-                    + GAMMA * next_value_fn[i][m.value],
+                moves_and_implied_values = [
+                    {
+                        "move": move,
+                        "implied_value": reward_fn[board_idx][move.value]
+                        + GAMMA * next_value_fn[board_idx][move.value],
+                    }
+                    for move in list(Move)
+                ]
+                best_move_and_implied_value = max(
+                    moves_and_implied_values,
+                    key=lambda x: x["implied_value"],
                 )
-                implied_value = (
-                    reward_fn[board_idx][best_move.value]
-                    + GAMMA * next_value_fn[board_idx][best_move.value]
-                )
-                results.append((best_move, implied_value))
+                best_moves_and_implied_values.append(best_move_and_implied_value)
 
-            return results
+            return best_moves_and_implied_values
 
     def play_games_and_get_trajectories(self, num_games, eps):
         boards = [get_new_board() for _ in range(num_games)]
@@ -156,38 +161,30 @@ class VNN(nn.Module):
             alive_indices = [i for i, a in enumerate(alive) if a]
             alive_boards = [boards[i] for i in alive_indices]
 
-            results = self.best_moves_and_implied_values(alive_boards)
+            best_moves_and_implied_values = self.best_moves_and_implied_values(
+                alive_boards
+            )
 
-            for result_idx, game_idx in enumerate(alive_indices):
+            for game_idx, best_move_and_implied_value in zip(
+                alive_indices, best_moves_and_implied_values
+            ):
                 board = boards[game_idx]
-                best_move, implied_value = results[result_idx]
-                new_board, _, changed = apply_move(board, best_move)
 
-                if np.random.rand() < eps:
-                    rand_move = random.choice(list(Move))
-                    new_board, _, changed = apply_move(board, rand_move)
-
-                trajectories[game_idx].append(
-                    Game_state(
-                        board=board,
-                        new_board=new_board,
-                        best_move=best_move,
-                        # TODO: we can probably train on a trajectory multiple times in which case we probably don't want to store this value
-                        implied_value_from_best_move=implied_value,
-                    )
+                new_board, _, changed = apply_move(
+                    board,
+                    (
+                        random.choice(list(Move))
+                        if np.random.rand() < eps
+                        else best_move_and_implied_value["move"]
+                    ),
                 )
 
                 if not changed:
                     alive[game_idx] = False
-                    trajectories[game_idx].append(
-                        Game_state(
-                            board=new_board,
-                            new_board=None,
-                            best_move=None,
-                            implied_value_from_best_move=0,
-                        )
-                    )
                 else:
-                    boards[game_idx] = add_new_tile(new_board)
+                    new_board_with_new_tile = add_new_tile(new_board)
+
+                    boards[game_idx] = new_board_with_new_tile
+                    trajectories[game_idx].append(new_board_with_new_tile)
 
         return trajectories

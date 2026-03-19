@@ -22,17 +22,18 @@ image = (
     .add_local_python_source("vnn", "engine")
 )
 
-EPOCHS = 100
-BATCH_SIZE = 30_000
-NEW_GAMES_PER_EPOCH = 100
+EPOCHS = 40
+NEW_GAMES_PER_EPOCH = 10
+TIMES_TO_BACKPROP_PER_EPOCH = 20
+MINI_BATCH_SIZE = 1024
 EPS_START = 0.9
 EPS_END = 0.0001
-EPS_DECAY = 10
-LR = 3e-4
+EPS_DECAY = 4
+LR = 3e-2
 
 
 @app.function(
-    gpu="T4",
+    gpu="A100",
     image=image,
     timeout=3600,
 )
@@ -41,8 +42,6 @@ def train():
     vnn = VNN(device=device).to(device)
     vnn.share_memory()
     optimizer = optim.AdamW(vnn.parameters(), lr=LR, amsgrad=True)
-
-    trajectories_by_epoch = dict()
 
     for epoch in range(EPOCHS):
         print("Epoch:", epoch)
@@ -57,32 +56,43 @@ def train():
             num_games=NEW_GAMES_PER_EPOCH, eps=eps_threshold
         )
 
-        trajectories_by_epoch[epoch] = trajectories_from_this_epoch
-
         print(
             "Average lengths of games",
             np.array([len(traj) for traj in trajectories_from_this_epoch]).mean(),
         )
 
-        states_to_train_on = [
-            state
-            for trajectories_from_game in trajectories_from_this_epoch
-            for state in trajectories_from_game
+        boards_to_train_on = [
+            board
+            for game_trajectory in trajectories_from_this_epoch
+            for board in game_trajectory
         ]
-        boards = [state.board for state in states_to_train_on]
 
-        target = [state.implied_value_from_best_move for state in states_to_train_on]
+        if len(boards_to_train_on) > 0:
+            criterion = nn.SmoothL1Loss()
+            for _ in range(TIMES_TO_BACKPROP_PER_EPOCH):
+                indices = np.random.choice(
+                    len(boards_to_train_on),
+                    size=min(MINI_BATCH_SIZE, len(boards_to_train_on)),
+                    replace=False,
+                )
+                mini_batch = [boards_to_train_on[i] for i in indices]
 
-        criterion = nn.SmoothL1Loss()
-        loss = criterion(
-            vnn.forward_from_int_boards(boards).reshape(-1),
-            torch.tensor(target, device=device),
-        )
+                target = [
+                    best_move_and_implied_value["implied_value"]
+                    for best_move_and_implied_value in vnn.best_moves_and_implied_values(
+                        mini_batch
+                    )
+                ]
 
-        optimizer.zero_grad()
-        loss.backward()
+                loss = criterion(
+                    vnn.forward_from_int_boards(mini_batch).reshape(-1),
+                    torch.tensor(target, device=device),
+                )
 
-        torch.nn.utils.clip_grad_value_(vnn.parameters(), 100)
-        optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_value_(vnn.parameters(), 100)
+                optimizer.step()
 
     return vnn

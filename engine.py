@@ -5,16 +5,13 @@ from collections import namedtuple, deque
 # Config
 P_NEW_TILE_IS_TWO = 0.9
 
-# Some useful classes
-Game_state = namedtuple(
-    "Game_state", ("board", "new_board", "best_move", "implied_value_from_best_move")
-)
 
 class Move(Enum):
     U = "U"
     L = "L"
     R = "R"
     D = "D"
+
 
 # mostly chatGPT generated engine code
 def _compress_and_merge(row):
@@ -113,6 +110,7 @@ def get_new_board():
     empty_board = np.zeros((4, 4), dtype=int)
 
     return add_new_tile(add_new_tile(empty_board))
+
 
 # useful util for computing expectations based on next state
 def possible_next_boards(board):
