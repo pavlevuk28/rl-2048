@@ -21,10 +21,13 @@ GAMMA = 0.999
 
 
 class VNN(nn.Module):
-    def __init__(self, intermediate_size=100, conv_out_size=10):
+    def __init__(self, device, intermediate_size=100, conv_out_size=10):
         super(VNN, self).__init__()
+        self.device = device
 
-        self.my_transformation = nn.Parameter(torch.randn(4, intermediate_size))
+        self.my_transformation = nn.Parameter(
+            torch.randn(4, intermediate_size, device=self.device)
+        )
 
         self.horizontal_conv = nn.Conv2d(
             in_channels=1,
@@ -81,101 +84,110 @@ class VNN(nn.Module):
 
     def forward_from_int_boards(self, boards):
         boards = np.array([b for b in boards], dtype="float32")
-        log_board = np.zeros_like(boards, dtype="float32")
+        log_boards = np.zeros_like(boards, dtype="float32")
         mask = boards != 0
 
-        log_board[mask] = np.log2(boards[mask])
+        log_boards[mask] = np.log2(boards[mask])
 
-        return self.forward(torch.tensor(log_board))
+        return self.forward(torch.tensor(log_boards, device=self.device))
 
-    def best_move_and_implied_value(self, board):
+    def best_moves_and_implied_values(self, boards):
         with torch.no_grad():
-            next_value_fn_dict = dict()
-            reward_fn_dict = {m: 0 for m in list(Move)}
+            n = len(boards)
+            reward_fn = [{m.value: 0 for m in list(Move)} for _ in range(n)]
+            next_value_fn = [{m.value: 0 for m in list(Move)} for _ in range(n)]
 
-            move_board_probability = []
+            # Collect all (board_idx, move_name, next_board, prob) in one pass
+            all_entries = []
+            for board_idx, board in enumerate(boards):
+                for move in list(Move):
+                    new_board, _, is_changed = apply_move(board, move)
+                    reward_fn[board_idx][move.value] = int(is_changed)
+                    if is_changed:
+                        for b, p in possible_next_boards(new_board):
+                            all_entries.append(
+                                {
+                                    "board_idx": board_idx,
+                                    "move": move.name,
+                                    "board": b,
+                                    "prob": p,
+                                }
+                            )
 
-            for move in list(Move):
-                new_board, score_change, changed = apply_move(board, move)
+            # Single batched forward pass over all next boards
+            if len(all_entries) > 0:
+                next_boards = [e["board"] for e in all_entries]
+                values = self.forward_from_int_boards(next_boards).flatten().tolist()
 
-                # reward ourselves for staying alive longer instead of for score maximizing 
-                reward_fn_dict[move.value] = int(changed)
-
-                if not changed:
-                    next_value_fn_dict[move.value] = 0
-                else:
-                    move_board_probability = move_board_probability + (
-                        [(move, b, p) for b, p in possible_next_boards(new_board)]
-                    )
-
-            moves = [m.name for m, _, _ in move_board_probability]
-            boards = [b for _, b, _ in move_board_probability]
-            values = (
-                self.forward_from_int_boards(boards).flatten().tolist()
-                if len(boards) > 0
-                else []
-            )
-            probabilities = [p for _, _, p in move_board_probability]
-
-            df = pd.DataFrame({"move": moves, "values": values, "probs": probabilities})
-            df["move"] = df["move"].astype(str)
-            df["value_x_prob"] = df.eval("values * probs")
-
-            next_value_fn_dict = next_value_fn_dict | dict(
-                df.groupby("move")["value_x_prob"].sum()
-            )
-
-            value_fn_dict = {
-                m.value: reward_fn_dict[m.value] + GAMMA * next_value_fn_dict[m.value]
-                for m in list(Move)
-            }
-
-            best_move = max(
-                list(Move),
-                key=lambda m: reward_fn_dict[m.value]
-                + GAMMA * next_value_fn_dict[m.value],
-            )
-
-            return best_move, value_fn_dict[best_move.value]
-
-    def play_game_and_get_trajectory(self, eps):
-        alive = True
-        board = get_new_board()
-        trajectory = []
-
-        while alive:
-            best_move, implied_value_from_best_move = self.best_move_and_implied_value(
-                board
-            )
-            new_board, reward, changed = apply_move(board, best_move)
-
-            if np.random.rand() < eps:
-                rand_move = random.choice(list(Move))
-                new_board, _, changed = apply_move(board, rand_move)
-
-            trajectory.append(
-                Game_state(
-                    board=board,
-                    new_board=new_board,
-                    best_move=best_move,
-                    implied_value_from_best_move=implied_value_from_best_move,
+                df = pd.DataFrame(
+                    {
+                        "board_idx": [e["board_idx"] for e in all_entries],
+                        "move": [e["move"] for e in all_entries],
+                        "values": values,
+                        "probs": [e["prob"] for e in all_entries],
+                    }
                 )
-            )
+                df["value_x_prob"] = df["values"] * df["probs"]
 
-            board = new_board
+                for (board_idx, move_name), group in df.groupby(["board_idx", "move"]):
+                    next_value_fn[board_idx][move_name] = group["value_x_prob"].sum()
 
-            if not changed:
-                alive = False
+            results = []
+            for board_idx in range(n):
+                best_move = max(
+                    list(Move),
+                    key=lambda m, i=board_idx: reward_fn[i][m.value]
+                    + GAMMA * next_value_fn[i][m.value],
+                )
+                implied_value = (
+                    reward_fn[board_idx][best_move.value]
+                    + GAMMA * next_value_fn[board_idx][best_move.value]
+                )
+                results.append((best_move, implied_value))
 
-                trajectory.append(
+            return results
+
+    def play_games_and_get_trajectories(self, num_games, eps):
+        boards = [get_new_board() for _ in range(num_games)]
+        trajectories = [[] for _ in range(num_games)]
+        alive = [True] * num_games
+
+        while any(alive):
+            alive_indices = [i for i, a in enumerate(alive) if a]
+            alive_boards = [boards[i] for i in alive_indices]
+
+            results = self.best_moves_and_implied_values(alive_boards)
+
+            for result_idx, game_idx in enumerate(alive_indices):
+                board = boards[game_idx]
+                best_move, implied_value = results[result_idx]
+                new_board, _, changed = apply_move(board, best_move)
+
+                if np.random.rand() < eps:
+                    rand_move = random.choice(list(Move))
+                    new_board, _, changed = apply_move(board, rand_move)
+
+                trajectories[game_idx].append(
                     Game_state(
                         board=board,
-                        new_board=None,
-                        best_move=None,
-                        implied_value_from_best_move=0,
+                        new_board=new_board,
+                        best_move=best_move,
+                        # TODO: we can probably train on a trajectory multiple times in which case we probably don't want to store this value
+                        implied_value_from_best_move=implied_value,
                     )
                 )
-            else:
-                board = add_new_tile(board)
 
-        return trajectory
+                if not changed:
+                    alive[game_idx] = False
+                    trajectories[game_idx].append(
+                        Game_state(
+                            board=new_board,
+                            new_board=None,
+                            best_move=None,
+                            implied_value_from_best_move=0,
+                        )
+                    )
+                else:
+                    boards[game_idx] = add_new_tile(new_board)
+
+        return trajectories
