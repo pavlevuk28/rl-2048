@@ -98,10 +98,8 @@ class VNN(nn.Module):
             for move in list(Move):
                 new_board, score_change, changed = apply_move(board, move)
 
+                # reward ourselves for staying alive longer instead of for score maximizing 
                 reward_fn_dict[move.value] = int(changed)
-                # reward_fn_dict[move.value] = (
-                #     np.log2(score_change) ** 2 if score_change > 0 else 0
-                # )
 
                 if not changed:
                     next_value_fn_dict[move.value] = 0
